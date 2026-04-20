@@ -1,0 +1,117 @@
+name: Build and publish go-provision package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev
+
+      - name: Build .deb
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE=go-provision
+          ARCH=arm64
+          BUILD="${RUNNER_TEMP}/${PACKAGE}_${VERSION}_${ARCH}"
+          DIST="${RUNNER_TEMP}/dist"
+
+          mkdir -p "${BUILD}/DEBIAN" \
+                   "${BUILD}/usr/bin" \
+                   "${BUILD}/usr/lib/systemd/system" \
+                   "${DIST}"
+
+          install -Dm755 go-provision-server \
+            "${BUILD}/usr/bin/go-provision-server"
+
+          install -Dm755 debian/go-reprovision \
+            "${BUILD}/usr/bin/go-reprovision"
+
+          install -Dm644 debian/go-provision.service \
+            "${BUILD}/usr/lib/systemd/system/go-provision.service"
+
+          cat > "${BUILD}/DEBIAN/control" << CONTROL
+          Package: ${PACKAGE}
+          Version: ${VERSION}
+          Architecture: ${ARCH}
+          Maintainer: GOcontroll B.V. <info@gocontroll.com>
+          Depends: python3, go-sn
+          Section: utils
+          Priority: optional
+          Homepage: https://gocontroll.com
+          Description: Provisioning service for GOcontroll Moduline controllers
+           Temporary HTTP service (port 8743) that exposes controller hardware
+           information as JSON for provisioning workflows. Reports hardware
+           version, module inventory with QR codes, serial number, modem/SIM
+           details, and WiFi adapter model.
+           Not started automatically; use go-reprovision to trigger.
+          CONTROL
+
+          cat > "${BUILD}/DEBIAN/postinst" << 'POSTINST'
+          #!/bin/bash
+          set -e
+          case "$1" in
+              configure)
+                  systemctl daemon-reload
+                  ;;
+          esac
+          POSTINST
+          chmod 755 "${BUILD}/DEBIAN/postinst"
+
+          cat > "${BUILD}/DEBIAN/prerm" << 'PRERM'
+          #!/bin/bash
+          set -e
+          case "$1" in
+              remove|purge)
+                  systemctl stop go-provision.service || true
+                  ;;
+          esac
+          PRERM
+          chmod 755 "${BUILD}/DEBIAN/prerm"
+
+          cat > "${BUILD}/DEBIAN/postrm" << 'POSTRM'
+          #!/bin/bash
+          set -e
+          case "$1" in
+              purge)
+                  systemctl daemon-reload || true
+                  ;;
+          esac
+          POSTRM
+          chmod 755 "${BUILD}/DEBIAN/postrm"
+
+          dpkg-deb -Zxz --build --root-owner-group "${BUILD}" \
+            "${DIST}/${PACKAGE}_${VERSION}_${ARCH}.deb"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/dist/go-provision_${{ steps.version.outputs.version }}_arm64.deb
+          generate_release_notes: true
+
+      - name: Trigger go-apt index rebuild
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DISPATCH_TOKEN }}
+          repository: GOcontroll/go-apt
+          event-type: rebuild-index
+          client-payload: |
+            {
+              "package": "go-provision",
+              "version": "${{ steps.version.outputs.version }}",
+              "arch": "arm64",
+              "deb_url": "https://github.com/GOcontroll/go-provision/releases/download/${{ github.ref_name }}/go-provision_${{ steps.version.outputs.version }}_arm64.deb"
+            }
