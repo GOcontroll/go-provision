@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+rm -f /etc/gocontroll/provisioned
+systemctl start go-provision.service
