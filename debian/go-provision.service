@@ -1,0 +1,10 @@
+[Unit]
+Description=GOcontroll provisioning service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/go-provision-server
+RuntimeMaxSec=120
+RemainAfterExit=no
