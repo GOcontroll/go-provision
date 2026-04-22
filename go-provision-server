@@ -8,7 +8,6 @@ Only stdlib, no pip packages required.
 import http.server
 import json
 import os
-import re
 import socket
 import subprocess
 
@@ -46,37 +45,42 @@ def _modules():
     """Return list of 8 slot dicts (or None for empty slots)."""
     results = [None] * 8
 
-    # Slot names from go-modules scan
-    names = {}
+    # go-modules scan outputs a Unicode box table with columns:
+    # ║ Slot ║ Type ║ HW ║ SW Version ║ Manufacturer ║ QR Front ║ QR Back ║
     scan = _run("go-modules scan")
     if scan:
         for line in scan.splitlines():
-            m = re.match(r"slot\s+(\d+):\s+(.+?)(?:\s+version\s+.*)?$", line, re.IGNORECASE)
-            if m:
-                names[int(m.group(1))] = m.group(2).strip()
+            if not line.startswith("║"):
+                continue
+            cells = [c.strip() for c in line.split("║")]
+            # cells[0] == '' (before leading ║), columns at [1]..[7]
+            if len(cells) < 8:
+                continue
+            try:
+                slot = int(cells[1])
+            except ValueError:
+                continue  # header row
+            results[slot - 1] = {
+                "slot":     slot,
+                "name":     cells[2] or None,
+                "qr_front": cells[6] or None,
+                "qr_rear":  cells[7] or None,
+            }
 
-    # QR codes from firmware files
-    fw_dir = "/lib/firmware/gocontroll/modules"
-    for slot in range(1, 9):
-        fw_file = os.path.join(fw_dir, f"slot{slot}")
-        qr_front = qr_rear = None
+    # Fallback: read QR codes from firmware file if scan produced nothing
+    if all(r is None for r in results):
         try:
-            with open(fw_file) as f:
-                lines = f.read().splitlines()
-            # File format: line 0=fw_versions, 1=mfr_ids, 2=qr_front, 3=qr_rear
-            qr_front = lines[2].strip() if len(lines) > 2 else None
-            qr_rear  = lines[3].strip() if len(lines) > 3 else None
+            with open("/lib/firmware/gocontroll/modules") as f:
+                file_lines = f.read().splitlines()
+            front_qrs = (file_lines[2].split(":") + [""] * 8)[:8] if len(file_lines) > 2 else [""] * 8
+            rear_qrs  = (file_lines[3].split(":") + [""] * 8)[:8] if len(file_lines) > 3 else [""] * 8
+            for i in range(8):
+                qf = front_qrs[i] or None
+                qr = rear_qrs[i]  or None
+                if qf or qr:
+                    results[i] = {"slot": i + 1, "name": None, "qr_front": qf, "qr_rear": qr}
         except OSError:
             pass
-
-        name = names.get(slot)
-        if name or qr_front or qr_rear:
-            results[slot - 1] = {
-                "slot":      slot,
-                "name":      name,
-                "qr_front":  qr_front,
-                "qr_rear":   qr_rear,
-            }
 
     return results
 
