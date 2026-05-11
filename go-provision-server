@@ -8,11 +8,15 @@ Only stdlib, no pip packages required.
 import http.server
 import json
 import os
+import re
 import socket
 import subprocess
+import time
 
 
 PORT = 8743
+MODEM_WAIT_SECONDS = 30
+MODEM_POLL_INTERVAL = 3
 
 # Murata WiFi USB adapter identifiers (idVendor:idProduct)
 WIFI_USB_IDS = {
@@ -22,100 +26,147 @@ WIFI_USB_IDS = {
 }
 
 
-def _run(cmd):
+def _run(cmd, timeout=10):
     """Run a shell command; return stripped stdout or None on failure."""
     try:
         out = subprocess.check_output(
-            cmd, shell=True, text=True, stderr=subprocess.DEVNULL
+            cmd, shell=True, text=True, stderr=subprocess.DEVNULL, timeout=timeout
         ).strip()
         return out or None
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return None
+
+
+def _read_dtb(name):
+    """Read a null-terminated dtb property."""
+    try:
+        with open(f"/sys/firmware/devicetree/base/{name}") as f:
+            return f.read().rstrip("\x00").strip() or None
+    except OSError:
+        return None
+
+
+def _platform():
+    """Platform string from dtb, e.g. 'Moduline M1'."""
+    return _read_dtb("platform")
 
 
 def _hardware_version():
+    """Hardware version from dtb 'hardware' field, e.g. 'Moduline Mini V1.11' → '1.11'."""
+    raw = _read_dtb("hardware")
+    if not raw:
+        raw = _run("identify")
+    if not raw:
+        return None, None
+    m = re.search(r"V?(\d+\.\d+(?:-[A-Za-z])?)", raw)
+    return (m.group(1) if m else None), raw
+
+
+def _software_version():
+    """Kernel version as 'Linux 6.12.x' (major.minor.x format)."""
+    raw = _run("uname -r")
+    if not raw:
+        return None
+    m = re.match(r"(\d+\.\d+)\.", raw)
+    if m:
+        return f"Linux {m.group(1)}.x"
+    return f"Linux {raw}"
+
+
+def _max_slots_for_platform(platform):
+    """Slot count per platform (from architecture: M1/M2=4, L4/L5/HMI1/HMI2=8)."""
+    if platform and re.search(r"\bM\d+\b", platform):
+        return 4
+    return 8
+
+
+def _modules(slot_count):
+    """Run go-modules scan and parse /lib/firmware/gocontroll/modules.json."""
+    _run("go-modules scan", timeout=20)
     try:
-        with open("/sys/firmware/devicetree/base/hardware") as f:
-            return f.read().rstrip("\x00").strip() or None
-    except OSError:
-        return _run("identify")
+        with open("/lib/firmware/gocontroll/modules.json") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return [{"slot": i + 1, "empty": True} for i in range(slot_count)]
+
+    result = []
+    by_slot = {s.get("slot"): s for s in data.get("slots", []) if isinstance(s, dict)}
+    for n in range(1, slot_count + 1):
+        s = by_slot.get(n)
+        if not s or not s.get("qr_front"):
+            result.append({"slot": n, "empty": True})
+            continue
+        result.append({
+            "slot":         n,
+            "empty":        False,
+            "qr_front":     s.get("qr_front") or None,
+            "qr_back":      s.get("qr_back") or None,
+            "module_type":  s.get("module_type") or None,
+            "firmware":     s.get("firmware") or None,
+            "manufacturer": s.get("manufacturer") or None,
+        })
+    return result
 
 
-def _modules():
-    """Return list of 8 slot dicts (or None for empty slots)."""
-    results = [None] * 8
-
-    # go-modules scan outputs a Unicode box table with columns:
-    # ║ Slot ║ Type ║ HW ║ SW Version ║ Manufacturer ║ QR Front ║ QR Back ║
-    scan = _run("go-modules scan")
-    if scan:
-        for line in scan.splitlines():
-            if not line.startswith("║"):
-                continue
-            cells = [c.strip() for c in line.split("║")]
-            # cells[0] == '' (before leading ║), columns at [1]..[7]
-            if len(cells) < 8:
-                continue
-            try:
-                slot = int(cells[1])
-            except ValueError:
-                continue  # header row
-            results[slot - 1] = {
-                "slot":     slot,
-                "name":     cells[2] or None,
-                "qr_front": cells[6] or None,
-                "qr_rear":  cells[7] or None,
-            }
-
-    # Fallback: read QR codes from firmware file if scan produced nothing
-    if all(r is None for r in results):
-        try:
-            with open("/lib/firmware/gocontroll/modules") as f:
-                file_lines = f.read().splitlines()
-            front_qrs = (file_lines[2].split(":") + [""] * 8)[:8] if len(file_lines) > 2 else [""] * 8
-            rear_qrs  = (file_lines[3].split(":") + [""] * 8)[:8] if len(file_lines) > 3 else [""] * 8
-            for i in range(8):
-                qf = front_qrs[i] or None
-                qr = rear_qrs[i]  or None
-                if qf or qr:
-                    results[i] = {"slot": i + 1, "name": None, "qr_front": qf, "qr_rear": qr}
-        except OSError:
-            pass
-
-    return results
+def _modem_present():
+    """True if mmcli sees at least one modem."""
+    raw = _run("mmcli -J --list-modems")
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+        return bool(data.get("modem-list"))
+    except json.JSONDecodeError:
+        return False
 
 
-def _modem():
-    """Return modem/SIM info via mmcli, or None if no modem present."""
-    modem_list = _run("mmcli -J --list-modems")
-    if not modem_list:
+def _read_modem():
+    """Read modem details via mmcli. Returns None on any failure."""
+    raw = _run("mmcli -J --list-modems")
+    if not raw:
         return None
     try:
-        data   = json.loads(modem_list)
-        modems = data.get("modem-list", [])
+        modems = json.loads(raw).get("modem-list", [])
         if not modems:
             return None
         modem_num = modems[0].split("/")[-1]
-        raw = _run(f"mmcli -J --modem={modem_num}")
-        if not raw:
+        md_raw = _run(f"mmcli -J --modem={modem_num}")
+        if not md_raw:
             return None
-        md     = json.loads(raw)["modem"]
+        md = json.loads(md_raw)["modem"]
         serial = md.get("generic", {}).get("equipment-identifier") or None
-        imei   = md.get("3gpp",    {}).get("imei")                 or None
+        imei   = md.get("3gpp", {}).get("imei") or None
 
-        # SIM ICCID
-        iccid    = None
+        iccid = None
         sim_path = md.get("generic", {}).get("sim")
         if sim_path:
-            sim_num  = sim_path.split("/")[-1]
-            sim_raw  = _run(f"mmcli -J --sim={sim_num}")
+            sim_num = sim_path.split("/")[-1]
+            sim_raw = _run(f"mmcli -J --sim={sim_num}")
             if sim_raw:
-                sd    = json.loads(sim_raw).get("sim", {})
+                sd = json.loads(sim_raw).get("sim", {})
                 iccid = sd.get("properties", {}).get("iccid") or None
 
-        return {"serial": serial, "sim_iccid": iccid, "imei": imei}
+        return {"detected": True, "serial": serial, "sim_iccid": iccid, "imei": imei}
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
+
+
+def _modem_flow():
+    """
+    Start go-wwan, poll up to MODEM_WAIT_SECONDS. If modem appears, enable
+    go-wwan for persistence and return its details. Otherwise return
+    {'detected': False}.
+    """
+    _run("systemctl start go-wwan.service", timeout=10)
+    deadline = time.monotonic() + MODEM_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if _modem_present():
+            info = _read_modem()
+            if info:
+                _run("systemctl enable go-wwan.service", timeout=10)
+                return info
+        time.sleep(MODEM_POLL_INTERVAL)
+    return {"detected": False, "serial": None, "sim_iccid": None, "imei": None}
 
 
 def _wifi():
@@ -148,8 +199,8 @@ def _network():
             try:
                 addr = open(f"/sys/class/net/{name}/address").read().strip()
                 if addr and addr != "00:00:00:00:00:00":
-                    mac  = addr
-                    ip   = _run(
+                    mac = addr
+                    ip = _run(
                         f"ip -4 addr show {name} | awk '/inet /{{print $2}}' | cut -d/ -f1"
                     )
                     break
@@ -168,14 +219,19 @@ def _serial():
 
 def build_info():
     mac, ip, hostname = _network()
+    platform = _platform()
+    hw_ver, hw_full = _hardware_version()
     return {
         "mac":              mac,
         "ip":               ip,
         "hostname":         hostname,
         "serial":           _serial(),
-        "hardware_version": _hardware_version(),
-        "modules":          _modules(),
-        "modem":            _modem(),
+        "platform":         platform,
+        "hardware_version": hw_ver,
+        "hardware_full":    hw_full,
+        "software_version": _software_version(),
+        "modules":          _modules(_max_slots_for_platform(platform)),
+        "modem":            _modem_flow(),
         "wifi":             _wifi(),
     }
 
