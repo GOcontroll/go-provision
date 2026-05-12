@@ -18,6 +18,12 @@ PORT = 8743
 MODEM_WAIT_SECONDS = 30
 MODEM_POLL_INTERVAL = 3
 
+VALID_SN_RE = re.compile(r"^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$")
+POSTINSTALL_PATH = "/usr/local/sbin/postinstall.sh"
+POSTINSTALL_LOG = "/var/log/go-provision-postinstall.log"
+RUN_SCRIPT_PATH = "/tmp/go-provision-run.sh"
+RUN_SCRIPT_LOG = "/var/log/go-provision-run.log"
+
 # Murata WiFi USB adapter identifiers (idVendor:idProduct)
 WIFI_USB_IDS = {
     "04b4:6502": "1DX",
@@ -217,6 +223,72 @@ def _serial():
     return _run("go-sn read")
 
 
+def _run_args(args, timeout=10):
+    """Run a command as argv list; return (ok, output)."""
+    try:
+        out = subprocess.check_output(
+            args, text=True, stderr=subprocess.STDOUT, timeout=timeout
+        ).strip()
+        return True, out
+    except subprocess.CalledProcessError as e:
+        return False, (e.output or "").strip() or str(e)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+
+
+def write_serial(sn):
+    """Write SN via go-sn and read back to validate."""
+    if not sn or not VALID_SN_RE.match(sn):
+        return {"ok": False, "error": "ongeldig SN-formaat (verwacht 4x4-4-4-4 alfanumeriek)"}
+    ok_w, out_w = _run_args(["go-sn", "w", sn])
+    if not ok_w:
+        return {"ok": False, "wrote": sn, "error": "go-sn write fout: " + out_w}
+    time.sleep(0.3)
+    ok_r, read_back = _run_args(["go-sn", "r"])
+    if not ok_r:
+        return {"ok": False, "wrote": sn, "error": "go-sn read fout: " + read_back}
+    if read_back != sn:
+        return {"ok": False, "wrote": sn, "read_back": read_back, "error": "read-back mismatch"}
+    return {"ok": True, "wrote": sn, "read_back": read_back}
+
+
+def start_postinstall():
+    """Start postinstall.sh in background, log to file. Returns immediately."""
+    try:
+        log_f = open(POSTINSTALL_LOG, "ab")
+        log_f.write(("\n=== %s start ===\n" % time.strftime("%Y-%m-%d %H:%M:%S")).encode())
+        log_f.flush()
+        subprocess.Popen(
+            [POSTINSTALL_PATH],
+            stdout=log_f, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {"started": True, "log": POSTINSTALL_LOG}
+    except (OSError, FileNotFoundError) as e:
+        return {"started": False, "error": str(e)}
+
+
+def run_script(script_content):
+    """Save script content to RUN_SCRIPT_PATH, exec via bash in background."""
+    try:
+        with open(RUN_SCRIPT_PATH, "w") as f:
+            f.write(script_content)
+        os.chmod(RUN_SCRIPT_PATH, 0o755)
+        log_f = open(RUN_SCRIPT_LOG, "ab")
+        log_f.write(("\n=== %s start ===\n" % time.strftime("%Y-%m-%d %H:%M:%S")).encode())
+        log_f.flush()
+        subprocess.Popen(
+            ["/bin/bash", RUN_SCRIPT_PATH],
+            stdout=log_f, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {"started": True, "log": RUN_SCRIPT_LOG, "size": len(script_content)}
+    except (OSError, FileNotFoundError) as e:
+        return {"started": False, "error": str(e)}
+
+
 def build_info():
     mac, ip, hostname = _network()
     platform = _platform()
@@ -237,6 +309,27 @@ def build_info():
 
 
 class ProvisionHandler(http.server.BaseHTTPRequestHandler):
+    def _respond(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b""
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
     def do_GET(self):
         if self.path == "/info":
             body = json.dumps(build_info(), indent=2).encode()
@@ -247,6 +340,34 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/sn":
+            body = self._read_json()
+            if body is None:
+                self._respond(400, {"ok": False, "error": "invalid JSON"})
+                return
+            sn = (body.get("serial") or "").strip()
+            result = write_serial(sn)
+            self._respond(200 if result.get("ok") else 400, result)
+            return
+        if self.path == "/postinstall":
+            result = start_postinstall()
+            self._respond(202 if result.get("started") else 500, result)
+            return
+        if self.path == "/run-script":
+            body = self._read_json()
+            if body is None:
+                self._respond(400, {"started": False, "error": "invalid JSON"})
+                return
+            script = body.get("script") or ""
+            if not script.strip():
+                self._respond(400, {"started": False, "error": "leeg script"})
+                return
+            result = run_script(script)
+            self._respond(202 if result.get("started") else 500, result)
+            return
+        self.send_error(404)
 
     def log_message(self, fmt, *args):
         pass  # suppress request logs
