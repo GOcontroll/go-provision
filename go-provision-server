@@ -15,8 +15,16 @@ import time
 
 
 PORT = 8743
-MODEM_WAIT_SECONDS = 30
-MODEM_POLL_INTERVAL = 3
+# Modem-detectie verloopt in twee fasen na "systemctl start go-wwan":
+#   1. USB-enumeratie van de SIM7600 duurt gemeten ~11 s. Als binnen
+#      USB_PROBE_SECONDS geen non-roothub USB-device verschijnt, gaan we
+#      ervan uit dat deze controller geen modem heeft en stoppen direct.
+#   2. Na USB-enumeratie duurt het nog ~13 s voor ModemManager (mmcli) de
+#      modem geregistreerd heeft. MODEM_AFTER_USB_SECONDS is de extra wachttijd
+#      die we daarna geven voordat we opgeven.
+USB_PROBE_SECONDS = 15
+MODEM_AFTER_USB_SECONDS = 20
+MODEM_POLL_INTERVAL = 1
 
 VALID_SN_RE = re.compile(r"^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$")
 POSTINSTALL_PATH = "/usr/local/sbin/postinstall.sh"
@@ -28,7 +36,12 @@ RUN_SCRIPT_LOG = "/var/log/go-provision-run.log"
 WIFI_USB_IDS = {
     "04b4:6502": "1DX",
     "0846:9053": "1MW",
-    "0bda:8179": "1YN",
+}
+
+# Murata WiFi SDIO identifiers (vendor:device as read from sysfs, lowercase 0x-prefixed)
+# 0x02d0 is the Broadcom/Cypress SDIO vendor ID used in Murata Type 1xx modules.
+WIFI_SDIO_IDS = {
+    "0x02d0:0xa9a6": "1YN",  # CYW43439
 }
 
 
@@ -99,17 +112,22 @@ def _modules(slot_count):
     by_slot = {s.get("slot"): s for s in data.get("slots", []) if isinstance(s, dict)}
     for n in range(1, slot_count + 1):
         s = by_slot.get(n)
-        if not s or not s.get("qr_front"):
+        # Slot is leeg als er geen module_type EN geen firmware bekend is.
+        # qr_front=0 (falsy) komt voor bij modules waarvan de QR nog niet in de
+        # EEPROM is geprogrammeerd; die wel rapporteren met qr_front=null zodat
+        # de DB-frontend ze aan een placeholder kan koppelen.
+        if not s or (not s.get("module_type") and not s.get("firmware")):
             result.append({"slot": n, "empty": True})
             continue
         result.append({
-            "slot":         n,
-            "empty":        False,
-            "qr_front":     s.get("qr_front") or None,
-            "qr_back":      s.get("qr_back") or None,
-            "module_type":  s.get("module_type") or None,
-            "firmware":     s.get("firmware") or None,
-            "manufacturer": s.get("manufacturer") or None,
+            "slot":             n,
+            "empty":            False,
+            "qr_front":         s.get("qr_front") or None,
+            "qr_back":          s.get("qr_back") or None,
+            "module_type":      s.get("module_type") or None,
+            "hardware_version": s.get("hardware_version") or None,
+            "firmware":         s.get("firmware") or None,
+            "manufacturer":     s.get("manufacturer") or None,
         })
     return result
 
@@ -124,6 +142,19 @@ def _modem_present():
         return bool(data.get("modem-list"))
     except json.JSONDecodeError:
         return False
+
+
+def _usb_modem_present():
+    """True if a USB device other than a Linux Foundation root hub is enumerated."""
+    raw = _run("lsusb")
+    if not raw:
+        return False
+    for line in raw.splitlines():
+        if "1d6b:" in line:  # Linux Foundation root hub
+            continue
+        if line.strip():
+            return True
+    return False
 
 
 def _read_modem():
@@ -159,13 +190,26 @@ def _read_modem():
 
 def _modem_flow():
     """
-    Start go-wwan, poll up to MODEM_WAIT_SECONDS. If modem appears, enable
-    go-wwan for persistence and return its details. Otherwise return
-    {'detected': False}.
+    Start go-wwan, then detect modem in twee fasen:
+      Fase 1: poll lsusb tot USB_PROBE_SECONDS. Geen non-roothub USB-device
+              binnen die tijd betekent dat deze controller geen modem heeft —
+              direct return {detected: False} zodat /info niet onnodig blijft hangen.
+      Fase 2: zodra USB-device verschijnt, poll mmcli tot MODEM_AFTER_USB_SECONDS
+              extra. ModemManager heeft tijd nodig om de AT-poorten te probeen
+              en de modem te registreren.
     """
     _run("systemctl start go-wwan.service", timeout=10)
-    deadline = time.monotonic() + MODEM_WAIT_SECONDS
-    while time.monotonic() < deadline:
+
+    usb_deadline = time.monotonic() + USB_PROBE_SECONDS
+    while time.monotonic() < usb_deadline:
+        if _usb_modem_present():
+            break
+        time.sleep(MODEM_POLL_INTERVAL)
+    else:
+        return {"detected": False, "serial": None, "sim_iccid": None, "imei": None}
+
+    register_deadline = time.monotonic() + MODEM_AFTER_USB_SECONDS
+    while time.monotonic() < register_deadline:
         if _modem_present():
             info = _read_modem()
             if info:
@@ -176,7 +220,20 @@ def _modem_flow():
 
 
 def _wifi():
-    """Detect Murata WiFi USB adapter model by USB ID, or None."""
+    """Detect Murata WiFi module via SDIO (Moduline default) or USB adapter."""
+    try:
+        for entry in os.listdir("/sys/bus/sdio/devices"):
+            base = f"/sys/bus/sdio/devices/{entry}"
+            try:
+                vid = open(f"{base}/vendor").read().strip()
+                pid = open(f"{base}/device").read().strip()
+                model = WIFI_SDIO_IDS.get(f"{vid}:{pid}")
+                if model:
+                    return {"model": model}
+            except OSError:
+                continue
+    except OSError:
+        pass
     try:
         for entry in os.listdir("/sys/bus/usb/devices"):
             base = f"/sys/bus/usb/devices/{entry}"
@@ -221,6 +278,97 @@ def _network():
 def _serial():
     """Read controller serial number via go-sn."""
     return _run("go-sn read")
+
+
+# Services that can be enabled/disabled via /services. Must stay in sync with
+# CTRL_SERVICES in GOcontroll-Database/index.js.
+MANAGED_SERVICES = [
+    "ssh",
+    "go-simulink",
+    "nodered",
+    "go-bluetooth",
+    "go-upload-server",
+    "go-auto-shutdown",
+    "gadget-getty@ttyGS0",
+    "getty@ttymxc2",
+    "go-web-ui",
+    "go-wwan",
+]
+
+
+def _service_exists(name):
+    """True if the unit file is known to systemd (list-unit-files contains a match)."""
+    out = _run(f"systemctl list-unit-files --no-legend --no-pager '{name}.service'")
+    if not out:
+        return False
+    return bool(out.strip())
+
+
+def _service_enabled(name):
+    """True if systemctl reports is-enabled in {enabled, enabled-runtime, static, alias, indirect}."""
+    out = _run(f"systemctl is-enabled '{name}.service'")
+    if out is None:
+        return False
+    return out.strip() in ("enabled", "enabled-runtime", "static", "alias", "indirect")
+
+
+def _service_active(name):
+    """True if systemctl is-active returns active."""
+    out = _run(f"systemctl is-active '{name}.service'")
+    if out is None:
+        return False
+    return out.strip() == "active"
+
+
+def services_status():
+    """Return list of {name, exists, enabled, active} for every managed service."""
+    result = []
+    for name in MANAGED_SERVICES:
+        if not _service_exists(name):
+            result.append({"name": name, "exists": False, "enabled": False, "active": False})
+            continue
+        result.append({
+            "name":    name,
+            "exists":  True,
+            "enabled": _service_enabled(name),
+            "active":  _service_active(name),
+        })
+    return result
+
+
+def services_apply(desired):
+    """
+    Apply the desired enable/disable state per service.
+    `desired` is a dict {service_name: bool}.
+    Only services in MANAGED_SERVICES are touched; unknown names are ignored.
+    Already-matching services are skipped (no-op) to keep changes minimal.
+    Returns a list of per-service result dicts.
+    """
+    results = []
+    if not isinstance(desired, dict):
+        return results
+    for name in MANAGED_SERVICES:
+        if name not in desired:
+            continue
+        want_enabled = bool(desired[name])
+        if not _service_exists(name):
+            results.append({"name": name, "ok": False, "skipped": True, "error": "service niet aanwezig"})
+            continue
+        current_enabled = _service_enabled(name)
+        current_active  = _service_active(name)
+        if current_enabled == want_enabled and current_active == want_enabled:
+            results.append({"name": name, "ok": True, "skipped": True, "enabled": want_enabled})
+            continue
+        verb_long  = "enable" if want_enabled else "disable"
+        verb_state = "start"  if want_enabled else "stop"
+        ok1, out1 = _run_args(["systemctl", verb_long,  f"{name}.service"])
+        ok2, out2 = _run_args(["systemctl", verb_state, f"{name}.service"])
+        if ok1 and ok2:
+            results.append({"name": name, "ok": True, "skipped": False, "enabled": want_enabled})
+        else:
+            err = (out1 if not ok1 else out2) or "onbekend"
+            results.append({"name": name, "ok": False, "skipped": False, "enabled": current_enabled, "error": err})
+    return results
 
 
 def _run_args(args, timeout=10):
@@ -338,8 +486,11 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        else:
-            self.send_error(404)
+            return
+        if self.path == "/services":
+            self._respond(200, {"services": services_status()})
+            return
+        self.send_error(404)
 
     def do_POST(self):
         if self.path == "/sn":
@@ -366,6 +517,18 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
                 return
             result = run_script(script)
             self._respond(202 if result.get("started") else 500, result)
+            return
+        if self.path == "/services":
+            body = self._read_json()
+            if body is None:
+                self._respond(400, {"ok": False, "error": "invalid JSON"})
+                return
+            desired = body.get("desired") if isinstance(body, dict) else None
+            if not isinstance(desired, dict):
+                self._respond(400, {"ok": False, "error": "verwacht: {\"desired\": {service: bool, ...}}"})
+                return
+            results = services_apply(desired)
+            self._respond(200, {"results": results})
             return
         self.send_error(404)
 
