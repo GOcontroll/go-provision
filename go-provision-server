@@ -190,14 +190,22 @@ def _read_modem():
 
 def _modem_flow():
     """
-    Start go-wwan, then detect modem in twee fasen:
-      Fase 1: poll lsusb tot USB_PROBE_SECONDS. Geen non-roothub USB-device
-              binnen die tijd betekent dat deze controller geen modem heeft —
-              direct return {detected: False} zodat /info niet onnodig blijft hangen.
-      Fase 2: zodra USB-device verschijnt, poll mmcli tot MODEM_AFTER_USB_SECONDS
-              extra. ModemManager heeft tijd nodig om de AT-poorten te probeen
-              en de modem te registreren.
+    Detecteer modem. Twee paden:
+      Warm pad: als mmcli al een modem ziet, lees direct uit. Geen systemctl-start —
+                dat triggert ExecStart van go-wwan opnieuw en kan ModemManager
+                de modem korte tijd doen verliezen.
+      Cold pad: start go-wwan.service, poll lsusb (max USB_PROBE_SECONDS) tot er
+                een non-roothub USB-device verschijnt, poll daarna mmcli (max
+                MODEM_AFTER_USB_SECONDS) tot ModemManager hem geregistreerd heeft.
     """
+    # Warm pad — als modem al up is, gewoon uitlezen en klaar.
+    if _modem_present():
+        info = _read_modem()
+        if info:
+            return info
+        # _modem_present True maar _read_modem faalt (race tussen --list en
+        # --modem=N): val door naar cold-pad-polling om opnieuw te proberen.
+
     _run("systemctl start go-wwan.service", timeout=10)
 
     usb_deadline = time.monotonic() + USB_PROBE_SECONDS
@@ -217,6 +225,53 @@ def _modem_flow():
                 return info
         time.sleep(MODEM_POLL_INTERVAL)
     return {"detected": False, "serial": None, "sim_iccid": None, "imei": None}
+
+
+def debug_modem():
+    """
+    Diagnostische dump van alle modem-detectie input. Geen state-wijzigingen.
+    Bedoeld om te debuggen waarom _modem_flow soms detected:false geeft op
+    een fysiek aanwezige modem.
+    """
+    sdio = []
+    try:
+        for entry in sorted(os.listdir("/sys/bus/sdio/devices")):
+            base = f"/sys/bus/sdio/devices/{entry}"
+            try:
+                vid = open(f"{base}/vendor").read().strip()
+                pid = open(f"{base}/device").read().strip()
+                sdio.append({"entry": entry, "vendor": vid, "device": pid})
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+    usb = []
+    try:
+        for entry in sorted(os.listdir("/sys/bus/usb/devices")):
+            base = f"/sys/bus/usb/devices/{entry}"
+            try:
+                vid = open(f"{base}/idVendor").read().strip()
+                pid = open(f"{base}/idProduct").read().strip()
+                usb.append({"entry": entry, "vendor": vid, "product": pid})
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+    return {
+        "lsusb":                _run("lsusb"),
+        "mmcli_list_modems":    _run("mmcli -J --list-modems"),
+        "mmcli_modem_0":        _run("mmcli -J --modem=0"),
+        "mmcli_version":        _run("mmcli --version"),
+        "go_wwan_active":       _run("systemctl is-active go-wwan.service"),
+        "go_wwan_enabled":      _run("systemctl is-enabled go-wwan.service"),
+        "modemmanager_active":  _run("systemctl is-active ModemManager.service"),
+        "sdio_devices":         sdio,
+        "usb_devices":          usb,
+        "usb_modem_present":    _usb_modem_present(),
+        "modem_present":        _modem_present(),
+    }
 
 
 def _wifi():
@@ -489,6 +544,9 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
             return
         if self.path == "/services":
             self._respond(200, {"services": services_status()})
+            return
+        if self.path == "/debug-modem":
+            self._respond(200, debug_modem())
             return
         self.send_error(404)
 
