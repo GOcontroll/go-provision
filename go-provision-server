@@ -31,6 +31,52 @@ POSTINSTALL_PATH = "/usr/local/sbin/postinstall.sh"
 POSTINSTALL_LOG = "/var/log/go-provision-postinstall.log"
 RUN_SCRIPT_PATH = "/tmp/go-provision-run.sh"
 RUN_SCRIPT_LOG = "/var/log/go-provision-run.log"
+STATE_DIR = "/var/lib/go-provision"
+RUN_STATUS_PATH = STATE_DIR + "/run-script.status"
+
+# Bash-prelude die voor elk run-script wordt gezet. Definieert helpers gp_status,
+# gp_done en gp_fail die naar RUN_STATUS_PATH schrijven. trap ERR roept gp_fail aan
+# zodat een falende stap zichtbaar wordt voor de provision-agent zonder dat het
+# script zelf bookkeeping hoeft te doen.
+RUN_SCRIPT_PRELUDE = r"""
+# --- gp_status helpers (geinjecteerd door go-provision) ---
+export GP_STATUS_FILE='""" + RUN_STATUS_PATH + r"""'
+export GP_START_TS="$(date -Iseconds)"
+mkdir -p '""" + STATE_DIR + r"""'
+gp_status() {
+  local phase="$1"
+  local now
+  now="$(date -Iseconds)"
+  cat > "${GP_STATUS_FILE}.tmp" <<JSON
+{"started_at":"${GP_START_TS}","phase":"${phase}","updated_at":"${now}","finished":false}
+JSON
+  mv "${GP_STATUS_FILE}.tmp" "${GP_STATUS_FILE}"
+}
+gp_done() {
+  local now
+  now="$(date -Iseconds)"
+  cat > "${GP_STATUS_FILE}.tmp" <<JSON
+{"started_at":"${GP_START_TS}","phase":"done","updated_at":"${now}","finished_at":"${now}","finished":true,"ok":true}
+JSON
+  mv "${GP_STATUS_FILE}.tmp" "${GP_STATUS_FILE}"
+}
+gp_fail() {
+  local rc=$?
+  local line="${BASH_LINENO[0]:-0}"
+  local now
+  now="$(date -Iseconds)"
+  cat > "${GP_STATUS_FILE}.tmp" <<JSON
+{"started_at":"${GP_START_TS}","phase":"error","updated_at":"${now}","finished_at":"${now}","finished":true,"ok":false,"exit_code":${rc},"line":${line}}
+JSON
+  mv "${GP_STATUS_FILE}.tmp" "${GP_STATUS_FILE}"
+}
+trap gp_fail ERR
+gp_status starting
+# --- einde prelude ---
+"""
+
+# Epilogue: markeer succes zodra het script alle stappen gepasseerd is zonder ERR-trap.
+RUN_SCRIPT_EPILOGUE = "\n# --- gp_done (geinjecteerd door go-provision) ---\ngp_done\n"
 
 # Murata WiFi USB adapter identifiers (idVendor:idProduct)
 WIFI_USB_IDS = {
@@ -472,12 +518,46 @@ def start_postinstall():
         return {"started": False, "error": str(e)}
 
 
-def run_script(script_content):
-    """Save script content to RUN_SCRIPT_PATH, exec via bash in background."""
+def _split_shebang(script):
+    """Return (shebang_line_with_newline, rest). Shebang must remain on line 1."""
+    if script.startswith("#!"):
+        nl = script.find("\n")
+        if nl == -1:
+            return script + "\n", ""
+        return script[:nl + 1], script[nl + 1:]
+    return "", script
+
+
+def _reset_run_status():
+    """Wipe any leftover status from a previous run, write a clean 'queued' marker."""
     try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        with open(RUN_STATUS_PATH + ".tmp", "w") as f:
+            json.dump({
+                "started_at": now,
+                "phase":      "queued",
+                "updated_at": now,
+                "finished":   False,
+            }, f)
+        os.replace(RUN_STATUS_PATH + ".tmp", RUN_STATUS_PATH)
+    except OSError:
+        pass
+
+
+def run_script(script_content):
+    """Save script content to RUN_SCRIPT_PATH, exec via bash in background.
+
+    Injects gp_status helpers (prelude) and gp_done call (epilogue) zodat
+    de provision-agent via /run-script/status zicht heeft op de huidige fase.
+    """
+    try:
+        shebang, body = _split_shebang(script_content)
+        wrapped = shebang + RUN_SCRIPT_PRELUDE + body + RUN_SCRIPT_EPILOGUE
         with open(RUN_SCRIPT_PATH, "w") as f:
-            f.write(script_content)
+            f.write(wrapped)
         os.chmod(RUN_SCRIPT_PATH, 0o755)
+        _reset_run_status()
         log_f = open(RUN_SCRIPT_LOG, "ab")
         log_f.write(("\n=== %s start ===\n" % time.strftime("%Y-%m-%d %H:%M:%S")).encode())
         log_f.flush()
@@ -490,6 +570,29 @@ def run_script(script_content):
         return {"started": True, "log": RUN_SCRIPT_LOG, "size": len(script_content)}
     except (OSError, FileNotFoundError) as e:
         return {"started": False, "error": str(e)}
+
+
+def run_script_status():
+    """Lees de huidige run-script status. Returnt None als er nog niets is."""
+    try:
+        with open(RUN_STATUS_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def shutdown_self():
+    """Stop go-provision.service in een gedetachte subprocess. Geeft direct True terug."""
+    try:
+        subprocess.Popen(
+            ["/bin/sh", "-c", "sleep 1; systemctl stop go-provision.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except (OSError, FileNotFoundError):
+        return False
 
 
 def build_info():
@@ -548,6 +651,13 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/debug-modem":
             self._respond(200, debug_modem())
             return
+        if self.path == "/run-script/status":
+            status = run_script_status()
+            if status is None:
+                self._respond(404, {"error": "geen run-script status (nog geen script gestart)"})
+                return
+            self._respond(200, status)
+            return
         self.send_error(404)
 
     def do_POST(self):
@@ -587,6 +697,10 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
                 return
             results = services_apply(desired)
             self._respond(200, {"results": results})
+            return
+        if self.path == "/shutdown":
+            ok = shutdown_self()
+            self._respond(202 if ok else 500, {"ok": ok, "stopping": ok})
             return
         self.send_error(404)
 
