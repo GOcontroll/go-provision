@@ -6,4 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/go-provision-server
+# Geen RuntimeMaxSec: de provision-agent stopt deze service expliciet via
+# POST /shutdown zodra de install klaar is. Een harde cgroup-timeout killde
+# vroeger installs halverwege cloudflared/go-deploy (zie provision-flow.md
+# §"Robustness-aandachtspunten").
 RemainAfterExit=no
