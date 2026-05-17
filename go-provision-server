@@ -84,10 +84,17 @@ WIFI_USB_IDS = {
     "0846:9053": "1MW",
 }
 
-# Murata WiFi SDIO identifiers (vendor:device as read from sysfs, lowercase 0x-prefixed)
-# 0x02d0 is the Broadcom/Cypress SDIO vendor ID used in Murata Type 1xx modules.
+# Murata WiFi SDIO identifiers. Sysfs (/sys/bus/sdio/devices/*/{vendor,device})
+# levert lowercase 0x-prefixed; wlan-uevent SDIO_ID=VVVV:DDDD levert hoofdletters
+# zonder 0x. Beide formaten staan in de dict zodat lookup eenvoudig blijft.
+# Murata 1YN (CYW43439) verschijnt onder de Broadcom-assigned vendor 0x02d0
+# (oudere kernels) of onder Cypress/Infineon 0x04b4 (kernel >=6.12 met
+# infineon,cyw43439-fmac binding, o.a. Moduline L4 3.06-D).
 WIFI_SDIO_IDS = {
-    "0x02d0:0xa9a6": "1YN",  # CYW43439
+    "0x02d0:0xa9a6": "1YN",
+    "02d0:a9a6":     "1YN",
+    "0x04b4:0xbd3d": "1YN",
+    "04b4:bd3d":     "1YN",
 }
 
 
@@ -321,13 +328,22 @@ def debug_modem():
 
 
 def _wifi():
-    """Detect Murata WiFi module via SDIO (Moduline default) or USB adapter."""
+    """Detect Murata WiFi module via SDIO (Moduline default), USB adapter,
+    of als laatste fallback de wlan-uevent.
+
+    Geeft None terug als er geen WiFi-hardware gevonden wordt. Vindt de
+    sysfs/USB-scan een match dan retourneren we {"model": "<naam>"} zoals
+    voorheen. Wordt geen match gevonden maar bestaat er wel een wlan-interface,
+    dan rapporteren we expliciet {"model": None, "sdio_id": ..., "iface": ...}
+    zodat de DB-frontend ziet dat er WiFi-hardware aanwezig is (zonder gokken
+    welk Murata-type) en het SDIO/USB-ID toegevoegd kan worden aan de mapping.
+    """
     try:
         for entry in os.listdir("/sys/bus/sdio/devices"):
             base = f"/sys/bus/sdio/devices/{entry}"
             try:
-                vid = open(f"{base}/vendor").read().strip()
-                pid = open(f"{base}/device").read().strip()
+                vid = open(f"{base}/vendor").read().strip().lower()
+                pid = open(f"{base}/device").read().strip().lower()
                 model = WIFI_SDIO_IDS.get(f"{vid}:{pid}")
                 if model:
                     return {"model": model}
@@ -335,6 +351,7 @@ def _wifi():
                 continue
     except OSError:
         pass
+
     try:
         for entry in os.listdir("/sys/bus/usb/devices"):
             base = f"/sys/bus/usb/devices/{entry}"
@@ -348,6 +365,33 @@ def _wifi():
                 continue
     except OSError:
         pass
+
+    # Fallback: wlan-interface aanwezig maar geen match in de SDIO/USB-mapping
+    # (bv. een nieuw kernel/binding-paar dat we nog niet kennen). We retourneren
+    # de SDIO_ID uit de uevent zodat de operator deze 1-op-1 aan de mapping kan
+    # toevoegen — beter dan stilzwijgend "geen WiFi" terugmelden.
+    try:
+        for name in sorted(os.listdir("/sys/class/net")):
+            if not name.startswith("wlan"):
+                continue
+            sdio_id = None
+            try:
+                with open(f"/sys/class/net/{name}/device/uevent") as f:
+                    for line in f:
+                        if line.startswith("SDIO_ID="):
+                            sdio_id = line.split("=", 1)[1].strip().lower()
+                            break
+            except OSError:
+                sdio_id = None
+            if sdio_id:
+                model = WIFI_SDIO_IDS.get(sdio_id)
+                if model:
+                    return {"model": model, "sdio_id": sdio_id}
+                return {"model": None, "sdio_id": sdio_id, "iface": name}
+            return {"model": None, "iface": name}
+    except OSError:
+        pass
+
     return None
 
 
