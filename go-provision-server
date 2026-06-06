@@ -97,6 +97,16 @@ WIFI_SDIO_IDS = {
     "04b4:bd3d":     "1YN",
 }
 
+# Display-paneel (dtb panel-node 'compatible') → DB display_adapter_types.adapter_type.
+# Alleen HMI/Display-controllers hebben een panel-node. De BOE-paneelnaam mapt
+# 1-op-1 op een adaptertype in de database (bv. boe,av123z7m-n17 → AV-123).
+# Nieuw paneel? Voeg de compatible-string hier toe én maak het bijbehorende
+# display_adapter_types-record aan in de GOcontroll-Database.
+DISPLAY_ADAPTER_PANELS = {
+    "boe,av101hdt-a10": "AV-101",
+    "boe,av123z7m-n17": "AV-123",
+}
+
 
 def _run(cmd, timeout=10):
     """Run a shell command; return stripped stdout or None on failure."""
@@ -118,9 +128,27 @@ def _read_dtb(name):
         return None
 
 
-def _platform():
-    """Platform string from dtb, e.g. 'Moduline M1'."""
-    return _read_dtb("platform")
+def _platform(hw_descriptor=None):
+    """Platform string, matchend met DB controller_series.controller_type
+    (bv. 'Moduline HMI1', 'Moduline M1').
+
+    Primaire bron is de dtb 'platform'-node. Oudere images (gebouwd vóór die
+    node bestond) hebben hem niet — dan vallen we terug op de hardware-
+    descriptor en classificeren die, net als go-web-ui (get_slot_prefix).
+    Een 'Moduline Display'-image hoort bij de DB-serie 'Moduline HMI1'. HMI2
+    wordt (nog) niet onderscheiden: dezelfde hardware-string 'Display', nog
+    niet in omloop — bewuste keuze, niet vergeten als HMI2 verschijnt.
+
+    hw_descriptor wordt door build_info doorgegeven (= hardware_full, dat al
+    de dtb 'hardware'-node óf `identify`-fallback dekt), zodat de classificatie
+    ook werkt op images zonder 'hardware'-dtb-node."""
+    plat = _read_dtb("platform")
+    if plat:
+        return plat
+    hw = (hw_descriptor or _read_dtb("hardware") or "").lower()
+    if "hmi" in hw or "display" in hw:
+        return "Moduline HMI1"
+    return plat
 
 
 def _hardware_version():
@@ -146,8 +174,15 @@ def _software_version():
 
 
 def _max_slots_for_platform(platform):
-    """Slot count per platform (from architecture: M1/M2=4, L4/L5/HMI1/HMI2=8)."""
-    if platform and re.search(r"\bM\d+\b", platform):
+    """Slot count per platform, conform DB controller_series.max_slots en
+    go-web-ui (MDS=2, MMS=4, M4S=8):
+      HMI*/Display -> 2 (MDS1/MDS2)
+      M1/M2        -> 4 (MMS1-4)
+      L*/IV/V e.a. -> 8 (M4S1-8)."""
+    p = (platform or "").upper()
+    if "HMI" in p or "DISPLAY" in p:
+        return 2
+    if re.search(r"\bM\d+\b", p):
         return 4
     return 8
 
@@ -183,6 +218,26 @@ def _modules(slot_count):
             "manufacturer":     s.get("manufacturer") or None,
         })
     return result
+
+
+def _display_adapter():
+    """Detecteer de display-adapter (paneel) uit de dtb panel-node.
+
+    HMI/Display-controllers dragen een 'panel'-node waarvan de `compatible` het
+    BOE-paneel benoemt; dat mapt 1-op-1 op een DB display_adapter_types-record
+    (bv. boe,av123z7m-n17 → AV-123). Het fysieke exemplaar (EMS-code) staat niet
+    in de hardware en wordt dus niet teruggegeven.
+
+    Returnt {"panel": <raw compatible>, "model": <adaptertype|None>} of None
+    wanneer er geen panel-node is (niet-display-controllers)."""
+    raw = _read_dtb("panel/compatible")
+    if not raw:
+        return None
+    # 'compatible' kan meerdere null-gescheiden strings bevatten; pak de eerste.
+    panel = raw.split("\x00")[0].strip()
+    if not panel:
+        return None
+    return {"panel": panel, "model": DISPLAY_ADAPTER_PANELS.get(panel.lower())}
 
 
 def _modem_present():
@@ -641,8 +696,8 @@ def shutdown_self():
 
 def build_info():
     mac, ip, hostname = _network()
-    platform = _platform()
     hw_ver, hw_full = _hardware_version()
+    platform = _platform(hw_full)
     return {
         "mac":              mac,
         "ip":               ip,
@@ -655,6 +710,7 @@ def build_info():
         "modules":          _modules(_max_slots_for_platform(platform)),
         "modem":            _modem_flow(),
         "wifi":             _wifi(),
+        "display_adapter":  _display_adapter(),
     }
 
 
